@@ -1228,6 +1228,8 @@ def main(*_args):
                 previous_iteration_time = None
 
             for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+                print('sss'.upper(), j)
+                continue
                 if j < skip_upto_batch:
                     continue
 
