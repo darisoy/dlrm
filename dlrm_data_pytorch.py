@@ -32,7 +32,7 @@ from numpy import random as ra
 
 # pytorch
 import torch
-from torch.utils.data import Dataset, RandomSampler
+from torch.utils.data import Dataset, IterableDataset, RandomSampler
 
 import data_loader_terabyte
 
@@ -541,6 +541,7 @@ class RandomDataset(Dataset):
     ):
         # compute batch size
         nbatches = int(np.ceil((data_size * 1.0) / mini_batch_size))
+        nbatches = 1
         if num_batches != 0:
             nbatches = num_batches
             data_size = nbatches * mini_batch_size
@@ -627,6 +628,26 @@ def collate_wrapper_random(list_of_tuples):
             T)
 
 
+class ReplicateDataset(IterableDataset):
+
+    def __init__(self, dat, len):
+        self.dat = dat
+        self.len = len
+        self.count = 0
+
+    def __iter__(self):
+        return ReplicateDataset(self.dat, self.len)
+
+    def __len__(self):
+        return self.len
+
+    def __next__(self):
+        self.count += 1
+        if self.count > self.len:
+            raise StopIteration
+        return self.dat[0]
+
+
 def make_random_data_and_loader(
     args, ln_emb, m_den, n_replicas=None, rank=None,
 ):
@@ -647,6 +668,7 @@ def make_random_data_and_loader(
         reset_seed_on_access=True,
         rand_seed=args.numpy_rand_seed
     )  # WARNING: generates a batch of lookups at once
+    train_data = ReplicateDataset(train_data, args.num_batches)
     train_sampler = None
     if rank is not None:
         torch.utils.data.distributed.DistributedSampler(

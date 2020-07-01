@@ -342,7 +342,6 @@ class DLRM_Net(nn.Module):
         if self.ndevices > 1:
             import torch_xla.core.xla_model as xm
             self._ordinal = xm.get_ordinal()
-            self._local_ordinal = xm.get_local_ordinal()
             self._all_reduce = xm.all_reduce
             self._all_gather = xm.all_gather
             self._all_to_all = xm.all_to_all
@@ -1228,8 +1227,6 @@ def main(*_args):
                 previous_iteration_time = None
 
             for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-                print('sss'.upper(), j)
-                continue
                 if j < skip_upto_batch:
                     continue
 
