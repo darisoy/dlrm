@@ -1287,6 +1287,8 @@ def main(*_args):
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
                     optimizer.zero_grad()
+                    if use_tpu and not args.tpu_data_parallel:
+                        emb_local_optimizer.zero_grad()
                     # backward pass
                     E.backward()
                     # debug prints (check gradient norm)
