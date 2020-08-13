@@ -101,6 +101,19 @@ import sklearn.metrics
 from torch.optim.lr_scheduler import _LRScheduler
 
 
+def printgradinfo(grads):
+    import torch_xla.core.xla_model as xm
+    o = xm.get_ordinal()
+    for grad in grads:
+        if grad.size(0) > 40  or grad.size(1) != 2:
+            continue
+        g = grad.cpu()
+        #g = grad.cpu() / xm.xrt_world_size()
+        g = str(g).split('\n')
+        g = ['GRADINFO-ordinal{}\t{}\t{}'.format(o, grad.shape, _)
+                for _ in g]
+        print('\n'.join(g))
+
 def _summary(prefix, t):
     dat = t.detach()
     #dat = [dat.shape, dat.min(), dat.max(), dat.sum()]
@@ -109,18 +122,23 @@ def _summary(prefix, t):
     return out.format(prefix, *dat)
 
 
-def summarize(step, *ts):
-    import torch_xla.core.xla_model as xm
-    prefix = 'STEP {} - ordinal {}'.format(step, xm.get_ordinal())
+def summarize(step, *ts, use_tpu=False):
+    if use_tpu:
+        import torch_xla.core.xla_model as xm
+        prefix = 'STEP {} - ordinal {}'.format(step, xm.get_ordinal())
+    else:
+        prefix = 'STEP {} - ordinal {}'.format(step, 'gpu')
     out = []
     for t in ts:
         if isinstance(t, list):
             out.extend(_summary(prefix, _) for _ in t)
         else:
             out.append(_summary(prefix, t))
-    xm.rendezvous('hi')
+    if use_tpu:
+        xm.rendezvous('hi')
     print('\n'.join(out))
-    xm.rendezvous('hi')
+    if use_tpu:
+        xm.rendezvous('hi')
 
 
 
@@ -412,6 +430,8 @@ class DLRM_Net(nn.Module):
             import torch_xla.core.xla_model as xm
             self._ordinal = xm.get_ordinal()
             self._all_gather = xm.all_gather
+            # FIXME: clean
+            self._mark_step = xm.mark_step
 
     def _filter_params(self, f):
         for name, p in self.named_parameters():
@@ -467,7 +487,9 @@ class DLRM_Net(nn.Module):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            # FIXME: clean this.
+            #T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            T = torch.cat([x] + ly, dim=1).reshape((batch_size, -1, d))
             # perform a dot product
             Z = torch.bmm(T, torch.transpose(T, 1, 2))
             # append dense feature with the interactions (into a row vector)
@@ -497,13 +519,13 @@ class DLRM_Net(nn.Module):
 
         return R
 
-    def forward(self, dense_x, lS_o, lS_i):
+    def forward(self, dense_x, lS_o, lS_i, j):
         if self.ndevices <= 1:
             return self.sequential_forward(dense_x, lS_o, lS_i)
         elif self.use_tpu:
-            return self.tpu_parallel_forward(dense_x, lS_o, lS_i)
+            return self.tpu_parallel_forward(dense_x, lS_o, lS_i, j)
         else:
-            return self.parallel_forward(dense_x, lS_o, lS_i)
+            return self.parallel_forward(dense_x, lS_o, lS_i, j)
 
     def clamp_output(self, p):
         z = p
@@ -561,7 +583,7 @@ class DLRM_Net(nn.Module):
             tensor, dim, self._xla_replica_index*local_bsz, local_bsz
         )
 
-    def tpu_parallel_forward(self, dense_x, lS_o, lS_i):
+    def tpu_parallel_forward(self, dense_x, lS_o, lS_i, j):
         batch_size = dense_x.size()[0]
         ndevices = self.ndevices
         assert not batch_size % ndevices, \
@@ -570,25 +592,33 @@ class DLRM_Net(nn.Module):
         dense_x = self.narrow(local_bsz, dense_x, dim=0)
 
         #bottom mlp
+        import torch_xla.core.xla_model as xm
         x = self.apply_mlp(dense_x, self.bot_l)
+        summarize('{}-PARALLELFWD-Bot'.format(j), x, use_tpu=1)
         # embeddings
         lS_i = self._partition_to_device(lS_i)
+        summarize('{}-PARALLELFWD-LocalEmbinput'.format(j), lS_i, use_tpu=1)
         # offset is assumed to be constant for tpus
         lS_o = [self.offset for _ in lS_i]
         ly_local = self.apply_emb(lS_o, lS_i, self.emb_l)
+        summarize('{}-PARALLELFWD-LocalEmb'.format(j), ly_local, use_tpu=1)
 
         # at this point, each device have the embeddings belonging to itself.
         # we do an all_to_all to acquire all embeddings, i.e. full input.
         ly = self._collect_distribute_embeddings(ly_local)
+        self._mark_step()
+        summarize('{}-PARALLELFWD-Emb'.format(j), ly, use_tpu=1)
 
         # now stop gradients from flowing back.
         ly = [_.clone().detach().requires_grad_(True) for _ in ly]
 
         # interactions
         z = self.interact_features(x, ly)
+        summarize('{}-PARALLELFWD-Interact'.format(j), z, use_tpu=1)
 
         # top mlp
         p = self.apply_mlp(z, self.top_l)
+        summarize('{}-PARALLELFWD-Top'.format(j), p, use_tpu=1)
 
         # clamp output if needed
         z = self.clamp_output(p)
@@ -609,7 +639,7 @@ class DLRM_Net(nn.Module):
         for e, g in zip(fullbatch_localembs, grad):
             e.backward(g)
 
-    def parallel_forward(self, dense_x, lS_o, lS_i):
+    def parallel_forward(self, dense_x, lS_o, lS_i, j):
         ### prepare model (overwrite) ###
         # WARNING: # of devices must be >= batch size in parallel_forward call
         batch_size = dense_x.size()[0]
@@ -661,11 +691,14 @@ class DLRM_Net(nn.Module):
         # The output is a list of tensors scattered across devices according to the
         # distribution of dense_x.
         x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
+        summarize('{}-PARALLELFWD-Bot'.format(j), x, use_tpu=False)
         # debug prints
         # print(x)
 
         # embeddings
         ly = self.apply_emb(lS_o, lS_i, self.emb_l)
+        summarize('{}-PARALLELFWD-LocalEmbinput'.format(j), lS_i, use_tpu=False)
+        summarize('{}-PARALLELFWD-LocalEmb'.format(j), ly, use_tpu=False)
         # debug prints
         # print(ly)
 
@@ -685,6 +718,8 @@ class DLRM_Net(nn.Module):
             t_list.append(y)
         # adjust the list to be ordered per device
         ly = list(map(lambda y: list(y), zip(*t_list)))
+        for k in range(ndevices):
+            summarize('{}-PARALLELFWD-Emb-device{}'.format(j, k), ly[k], use_tpu=False)
         # debug prints
         # print(ly)
 
@@ -693,6 +728,7 @@ class DLRM_Net(nn.Module):
         for k in range(ndevices):
             zk = self.interact_features(x[k], ly[k])
             z.append(zk)
+        summarize('{}-PARALLELFWD-Interact'.format(j), z, use_tpu=False)
         # debug prints
         # print(z)
 
@@ -706,6 +742,7 @@ class DLRM_Net(nn.Module):
 
         ### gather the distributed results ###
         p0 = gather(p, self.output_d, dim=0)
+        summarize('{}-PARALLELFWD-Top'.format(j), p0)
 
         # clamp output if needed
         z0 = self.clamp_output(p0)
@@ -1197,7 +1234,7 @@ def main(*_args):
             torch.cuda.synchronize()
         return time.time()
 
-    def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, tpu_return_val_only=False):
+    def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, tpu_return_val_only=False, j=None):
         if use_gpu:  # .cuda()
             # lS_i can be either a list of tensors or a stacked tensor.
             # Handle each case below:
@@ -1205,11 +1242,11 @@ def main(*_args):
                 else lS_i.to(device)
             lS_o = [S_o.to(device) for S_o in lS_o] if isinstance(lS_o, list) \
                 else lS_o.to(device)
-            return dlrm(X.to(device), lS_o, lS_i)
+            return dlrm(X.to(device), lS_o, lS_i, j)
         elif tpu_return_val_only:
-            return dlrm(X, lS_o, lS_i)[0]
+            return dlrm(X, lS_o, lS_i, j)[0]
         else:
-            return dlrm(X, lS_o, lS_i)
+            return dlrm(X, lS_o, lS_i, j)
 
     def loss_fn_wrap(Z, T, use_gpu, device):
         if T.size(0) > Z.size(0):
@@ -1337,10 +1374,12 @@ def main(*_args):
             for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
                 # FIXME:delete
                 if j < 10:
-                    summarize('{}dat'.format(j), X, lS_o, lS_i, T)
-                    summarize('{}bot'.format(j), *list(dlrm.bot_l.parameters()))
-                    summarize('{}top'.format(j), *list(dlrm.top_l.parameters()))
-                    summarize('{}emb'.format(j), *[e.weight for e in dlrm.emb_l])
+                    summarize('{}dat'.format(j), X, lS_o, lS_i, T, use_tpu=use_tpu)
+                    summarize('{}bot'.format(j), *list(dlrm.bot_l.parameters()), use_tpu=use_tpu)
+                    summarize('{}top'.format(j), *list(dlrm.top_l.parameters()), use_tpu=use_tpu)
+                    summarize('{}emb'.format(j), *[e.weight for e in dlrm.emb_l], use_tpu=use_tpu)
+                else:
+                    raise
                 if j < skip_upto_batch:
                     continue
 
@@ -1372,12 +1411,17 @@ def main(*_args):
                 if use_tpu and not args.tpu_data_parallel:
                     # args[1:] below will be used in the custom backward
                     Z, fullbatch_localembs, localbatch_fullembs = \
-                        dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+                        dlrm_wrap(X, lS_o, lS_i, use_gpu, device, j=j)
                 else:
-                    Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
+                    Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device, j=j)
 
                 # loss
                 E = loss_fn_wrap(Z, T, use_gpu, device)
+                #if not j % 1024:
+                if j < 10:
+                    if use_tpu:
+                        xm.mark_step()
+                    print('RAWLOSS @ STEP', j, E)
                 '''
                 # debug prints
                 print("output and loss")
@@ -1391,8 +1435,6 @@ def main(*_args):
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
                     optimizer.zero_grad()
-                    if use_tpu and not args.tpu_data_parallel:
-                        emb_local_optimizer.zero_grad()
                     # backward pass
                     E.backward()
                     # debug prints (check gradient norm)
@@ -1406,6 +1448,7 @@ def main(*_args):
                         # Full allreduce across all devices for the MLP parts.
                         xm.optimizer_step(optimizer, groups=None)
                         # bwd pass for the embedding tables.
+                        emb_local_optimizer.zero_grad()
                         dlrm.tpu_local_backward(
                             fullbatch_localembs, localbatch_fullembs,
                         )
