@@ -1062,7 +1062,7 @@ if __name__ == "__main__":
     import sys
     import operator
     import argparse
-
+    
     ### parse arguments ###
     parser = argparse.ArgumentParser(description="Generate Synthetic Distributions")
     parser.add_argument("--trace-file", type=str, default="./input/trace.log")
@@ -1074,54 +1074,75 @@ if __name__ == "__main__":
     )
     parser.add_argument("--numpy-rand-seed", type=int, default=123)
     parser.add_argument("--print-precision", type=int, default=5)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--data-generation", type=str, default="random"
+    )  # synthetic or dataset
+    parser.add_argument("--data-set", type=str, default="kaggle")  # or terabyte
+    parser.add_argument("--raw-data-file", type=str, default="")
+    parser.add_argument("--max-ind-range", type=int, default=-1)
+    parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
+    parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
+    parser.add_argument("--processed-data-file", type=str, default="")
+    parser.add_argument("--memory-map", action="store_true", default=False)
+    parser.add_argument("--mlperf-logging", action="store_true", default=False)
+    parser.add_argument("--mini-batch-size", type=int, default=1)
+    parser.add_argument("--test-mini-batch-size", type=int, default=-1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--drop-last", action="store_true")
+    parser.add_argument("--test-num-workers", type=int, default=-1)
+    args, unknown = parser.parse_known_args()
+    
+    if (args.data_generation == "dataset"):
+        data_args = [args]
+        make_criteo_data_and_loaders(*data_args)
 
-    ### some basic setup ###
-    np.random.seed(args.numpy_rand_seed)
-    np.set_printoptions(precision=args.print_precision)
+    else:
+        ### some basic setup ###
+        np.random.seed(args.numpy_rand_seed)
+        np.set_printoptions(precision=args.print_precision)
+    
+        ### read trace ###
+        trace = read_trace_from_file(args.trace_file)
+        # print(trace)
 
-    ### read trace ###
-    trace = read_trace_from_file(args.trace_file)
-    # print(trace)
+        ### profile trace ###
+        (_, stack_distances, line_accesses) = trace_profile(
+            trace, args.trace_enable_padding
+        )
+        stack_distances.reverse()
+        line_accesses.reverse()
+        # print(line_accesses)
+        # print(stack_distances)
 
-    ### profile trace ###
-    (_, stack_distances, line_accesses) = trace_profile(
-        trace, args.trace_enable_padding
-    )
-    stack_distances.reverse()
-    line_accesses.reverse()
-    # print(line_accesses)
-    # print(stack_distances)
+        ### compute probability distribution ###
+        # count items
+        l = len(stack_distances)
+        dc = sorted(
+            collections.Counter(stack_distances).items(), key=operator.itemgetter(0)
+        )
 
-    ### compute probability distribution ###
-    # count items
-    l = len(stack_distances)
-    dc = sorted(
-        collections.Counter(stack_distances).items(), key=operator.itemgetter(0)
-    )
+        # create a distribution
+        list_sd = list(map(lambda tuple_x_k: tuple_x_k[0], dc))  # x = tuple_x_k[0]
+        dist_sd = list(
+            map(lambda tuple_x_k: tuple_x_k[1] / float(l), dc)
+        )  # k = tuple_x_k[1]
+        cumm_sd = []  # np.cumsum(dc).tolist() #prefixsum
+        for i, (_, k) in enumerate(dc):
+            if i == 0:
+                cumm_sd.append(k / float(l))
+            else:
+                # add the 2nd element of the i-th tuple in the dist_sd list
+                cumm_sd.append(cumm_sd[i - 1] + (k / float(l)))
 
-    # create a distribution
-    list_sd = list(map(lambda tuple_x_k: tuple_x_k[0], dc))  # x = tuple_x_k[0]
-    dist_sd = list(
-        map(lambda tuple_x_k: tuple_x_k[1] / float(l), dc)
-    )  # k = tuple_x_k[1]
-    cumm_sd = []  # np.cumsum(dc).tolist() #prefixsum
-    for i, (_, k) in enumerate(dc):
-        if i == 0:
-            cumm_sd.append(k / float(l))
-        else:
-            # add the 2nd element of the i-th tuple in the dist_sd list
-            cumm_sd.append(cumm_sd[i - 1] + (k / float(l)))
+        ### write stack_distance and line_accesses to a file ###
+        write_dist_to_file(args.dist_file, line_accesses, list_sd, cumm_sd)
 
-    ### write stack_distance and line_accesses to a file ###
-    write_dist_to_file(args.dist_file, line_accesses, list_sd, cumm_sd)
-
-    ### generate correspondinf synthetic ###
-    # line_accesses, list_sd, cumm_sd = read_dist_from_file(args.dist_file)
-    synthetic_trace = trace_generate_lru(
-        line_accesses, list_sd, cumm_sd, len(trace), args.trace_enable_padding
-    )
-    # synthetic_trace = trace_generate_rand(
-    #     line_accesses, list_sd, cumm_sd, len(trace), args.trace_enable_padding
-    # )
-    write_trace_to_file(args.synthetic_file, synthetic_trace)
+        ### generate correspondinf synthetic ###
+        # line_accesses, list_sd, cumm_sd = read_dist_from_file(args.dist_file)
+        synthetic_trace = trace_generate_lru(
+            line_accesses, list_sd, cumm_sd, len(trace), args.trace_enable_padding
+        )
+        # synthetic_trace = trace_generate_rand(
+        #     line_accesses, list_sd, cumm_sd, len(trace), args.trace_enable_padding
+        # )
+        write_trace_to_file(args.synthetic_file, synthetic_trace)
