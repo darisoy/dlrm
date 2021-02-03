@@ -1278,7 +1278,7 @@ def main(*_args):
         "time/loss/accuracy (if enabled):  {}".format(datetime.now(),
         flush=True),
     )
-    with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
+    with torch.autograd.profiler.profile(args.enable_profiling and use_gpu) as prof:
         while k < args.nepochs:
             if k < skip_upto_epoch:
                 continue
