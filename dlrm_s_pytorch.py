@@ -95,6 +95,7 @@ import sklearn.metrics
 
 from torch.optim.lr_scheduler import _LRScheduler
 
+from torch_xla.experimental import pjrt
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -781,7 +782,7 @@ def tpu_get_xla_replica_groups(args):
     if args.tpu_data_parallel:
         return [[i] for i in range(world_size)], [list(range(world_size))]
     num_tables = args.arch_embedding_size.count("-") + 1
-    len_mp_group = args.tpu_model_parallel_group_len
+    len_mp_group = int(args.tpu_model_parallel_group_len/2)
     #assert not num_tables % len_mp_group, \
     #    'Model parallel group size has to divide number of emb tables evenly.'
     assert not world_size % len_mp_group, \
@@ -811,7 +812,7 @@ def tpu_get_xla_replica_groups(args):
     return mp_groups, dp_groups, data_n_replicas, data_rank
 
 
-def main(*_args):
+def main():
     ### import packages ###
     import sys
 
@@ -1102,6 +1103,7 @@ def main(*_args):
             dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb)
         dlrm.device = device
         dlrm = dlrm.to(device)
+        pjrt.broadcast_master_param(dlrm)
 
     # specify the loss function
     if args.loss_function == "mse":
@@ -1609,7 +1611,8 @@ def main(*_args):
 
             k += 1  # nepochs
             if use_tpu and args.tpu_metrics_debug:
-                print(met.metrics_report())
+                print("met.metrics_report() not implemented in PjRT.")
+                # print(met.metrics_report())
 
     # profiling
     if args.enable_profiling:

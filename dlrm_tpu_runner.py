@@ -1,7 +1,7 @@
 import sys
 import argparse
 
-import torch_xla.distributed.xla_multiprocessing as xmp
+from torch_xla.experimental import pjrt
 
 from dlrm_s_pytorch import main, parse_args
 
@@ -12,4 +12,5 @@ if __name__ == '__main__':
         "--tpu-cores", type=int, default=8, choices=[1, 8]
     )
     pre_spawn_flags, _ = pre_spawn_parser.parse_known_args()
-    xmp.spawn(main, args=(), nprocs=pre_spawn_flags.tpu_cores)
+    pjrt.run_multiprocess(main)
+    # xmp.spawn(main, args=(), nprocs=pre_spawn_flags.tpu_cores)
