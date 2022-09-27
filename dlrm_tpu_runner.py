@@ -13,5 +13,5 @@ if __name__ == '__main__':
 
     mp.set_start_method("spawn")
 
-    pjrt.run_multiprocess(main)
+    pjrt._run_multiprocess(main)
     # xmp.spawn(main, args=(), nprocs=pre_spawn_flags.tpu_cores)
